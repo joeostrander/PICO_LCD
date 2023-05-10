@@ -14,6 +14,7 @@
 #include "hardware/vreg.h"
 #include "pico/stdio.h"
 #include "hardware/pwm.h"
+#include "math.h"
 
 #define MIN_RUN 3
 
@@ -50,8 +51,8 @@ const scanvideo_mode_t vga_mode_tft_480x272 =
         .pio_program = &video_24mhz_composable,
         .width = 480,
         .height = 272,
-        .xscale = 1,
-        .yscale = 1,
+        .xscale = 2,
+        .yscale = 2,
 };
 
 const scanvideo_timing_t vga_timing_800x480 =
@@ -125,11 +126,14 @@ static semaphore_t video_initted;
 
 static void core1_func(void);
 static void render_scanline(scanvideo_scanline_buffer_t *buffer);
+int32_t single_scanline(uint32_t *buf, size_t buf_length, int line_index);
 static void initialize_gpio(void);
 static uint16_t rgb888_to_rgb332(uint32_t color);
+static uint16_t rgb888_to_rgb332_alt(uint8_t r, uint8_t g, uint8_t b);
 static void blink(uint8_t count, uint16_t millis_on, uint16_t millis_off);
 static void set_backlight_level(int backlight_level);
 int32_t single_solid_line(uint32_t *buf, size_t buf_length, uint16_t color);
+uint8_t reverse(uint8_t b);
 
 int main(void) 
 {
@@ -175,20 +179,188 @@ int32_t single_solid_line(uint32_t *buf, size_t buf_length, uint16_t color)
 
 static void render_scanline(scanvideo_scanline_buffer_t *dest) 
 {
-    uint32_t *buf = dest->data;
-    size_t buf_length = dest->data_max;
-    uint16_t line_num = scanvideo_scanline_number(dest->scanline_id);
+  uint32_t *buf = dest->data;
+  size_t buf_length = dest->data_max;
+  int line_num = scanvideo_scanline_number(dest->scanline_id);
+  dest->data_used = single_scanline(buf, buf_length, line_num);
+  dest->status = SCANLINE_OK;
+}
 
+
+int32_t single_scanline(uint32_t *buf, size_t buf_length, int line_index)
+{
+    uint16_t* p16 = (uint16_t *) buf;
+    uint16_t* first_pixel;
+
+    *p16++ = COMPOSABLE_RAW_RUN;
+    first_pixel = p16;
+    *p16++ = 0; // first pixel, should replace later, but maybe just leave black
+    *p16++ = VGA_MODE.width - MIN_RUN;
+
+    uint16_t pixel_count = 1;
+    uint16_t lines_per_section = VGA_MODE.height/VGA_MODE.yscale/5;
     uint16_t color;
-    uint16_t total_lines = VGA_MODE.height/VGA_MODE.yscale;
-    uint16_t bar_height = (total_lines)/NUMBER_OF_COLORS; 
+    uint16_t total_columns = VGA_MODE.width/VGA_MODE.xscale;
+    uint8_t bits_red = (uint16_t)PICO_SCANVIDEO_DPI_PIXEL_RCOUNT;
+    uint8_t bits_green = (uint16_t)PICO_SCANVIDEO_DPI_PIXEL_GCOUNT;
+    uint8_t bits_blue = (uint16_t)PICO_SCANVIDEO_DPI_PIXEL_BCOUNT;
+    uint8_t red = 0;
+    uint8_t green = 0;
+    uint8_t blue = 0;
+    uint8_t shift_red = 8 - bits_red;
+    uint8_t shift_green = 8 - bits_green;
+    uint8_t shift_blue = 8 - bits_blue;
 
-    uint16_t index = line_num / bar_height;
-    index = index >= NUMBER_OF_COLORS ? 0 : index;
-    color = rgb888_to_rgb332(basic_colors[index]);
+    uint16_t levels_red = pow(2,bits_red);
+    uint16_t levels_green = pow(2,bits_green);
+    uint16_t levels_blue = pow(2,bits_blue);
 
-    dest->data_used = single_solid_line(buf, buf_length, color);
-    dest->status = SCANLINE_OK;
+    uint16_t step_red = 1 << shift_red;
+    uint16_t step_green = 1 << shift_green;
+    uint16_t step_blue = 1 << shift_blue;
+
+    uint16_t max_red = (levels_red - 1) << shift_red;
+    uint16_t max_green = (levels_green - 1) << shift_green;
+    uint16_t max_blue = (levels_blue - 1) << shift_blue;
+
+    
+    uint16_t color_sections = 5;
+    uint16_t cols_per_section = total_columns/color_sections;
+
+    uint16_t total_steps_red = max_red / step_red + 1;
+    uint16_t total_steps_green = max_green / step_green + 1;
+    uint16_t total_steps_blue = max_blue / step_blue + 1;
+    uint16_t cols_per_step_red = cols_per_section/total_steps_red;
+    uint16_t cols_per_step_green = cols_per_section/total_steps_green;
+    uint16_t cols_per_step_blue = cols_per_section/total_steps_blue;
+
+    int i;
+
+    if (line_index < lines_per_section)
+    {
+      for (i = levels_red-1; i > 0; i--)
+      {
+        red = i << shift_red;
+        color = rgb888_to_rgb332_alt(red, green, blue);
+        for (int j = 0; j < (total_columns/(levels_red-1)); j++)
+        {
+          *p16++ = color;
+          pixel_count++;
+        }
+      }
+    }
+    else if (line_index < lines_per_section*2)
+    {
+      for (i = levels_green-1; i > 0; i--)
+      {
+        green = i << shift_green;
+        color = rgb888_to_rgb332_alt(red, green, blue);
+        for (int j = 0; j < (total_columns/(levels_green-1)); j++)
+        {
+          *p16++ = color;
+          pixel_count++;
+        }
+      }
+    }
+    else if (line_index < lines_per_section*3)
+    {
+
+      for (i = levels_blue-1; i > 0; i--)
+      {
+        blue = i << shift_blue;
+        color = rgb888_to_rgb332_alt(red, green, blue);
+        for (int j = 0; j < (total_columns/(levels_blue-1)); j++)
+        {
+          *p16++ = color;
+          pixel_count++;
+        }
+      }
+    }
+    else if (line_index < lines_per_section*4)
+    {
+      for (i = levels_blue-1; i >= 0; i--)
+      {
+        red = i << shift_blue;
+        green = i << shift_blue;
+        blue = i << shift_blue;
+        color = rgb888_to_rgb332_alt(red, green, blue);
+        for (int j = 0; j < (total_columns/levels_blue); j++)
+        {
+          *p16++ = color;
+          pixel_count++;
+        }
+      }
+    }
+    else
+    {
+      red = max_red;
+      for (i = 0; i < cols_per_section; i++)
+      {
+          green = (i / cols_per_step_green) * step_green;
+          color = rgb888_to_rgb332_alt(red, green, blue);
+          
+          *p16++ = color;
+          pixel_count++;
+      }
+
+      for (i = cols_per_section-1; i >= 0; i--)
+      {
+          red = (i / cols_per_step_red) * step_red;
+          color = rgb888_to_rgb332_alt(red, green, blue);
+          *p16++ = color;
+          pixel_count++;
+      }
+
+      for (i = 0; i < cols_per_section; i++)
+      {
+          blue = (i / cols_per_step_blue) * step_blue;
+          color = rgb888_to_rgb332_alt(red, green, blue);
+          *p16++ = color;
+          pixel_count++;
+      }
+
+      for (i = cols_per_section-1; i >= 0; i--)
+      {
+          green = (i / cols_per_step_green) * step_green;
+          color = rgb888_to_rgb332_alt(red, green, blue);
+          *p16++ = color;
+          pixel_count++;
+      }
+
+      for (i = 0; i < cols_per_section; i++)
+      {
+          red = (i / cols_per_step_red) * step_red;
+          color = rgb888_to_rgb332_alt(red, green, blue);
+          *p16++ = color;
+          pixel_count++;
+      }
+
+
+    }
+
+    while (pixel_count < VGA_MODE.width/VGA_MODE.xscale)
+    {
+      *p16++ = color;
+      pixel_count++;
+    }
+    
+    // black pixel to end line
+    *p16++ = COMPOSABLE_RAW_1P;
+    *p16++ = 0;
+
+
+    *p16++ = COMPOSABLE_EOL_ALIGN;  // TODO... how to determine when to do skip align
+
+    return ((uint32_t *) p16) - buf;
+
+}
+
+uint8_t reverse(uint8_t b) 
+{
+   b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+   b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+   b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+   return b;
 }
 
 static void core1_func(void) 
@@ -230,10 +402,30 @@ static void initialize_gpio(void)
 
 static uint16_t rgb888_to_rgb332(uint32_t color)
 {
-    uint32_t red = (color & 0xE00000) >> 21;
-    uint32_t green = (color & 0xE000) >> 13;
-    uint32_t blue = (color & 0xC0) >> 6;
-    return (uint16_t)( ( blue<<PICO_SCANVIDEO_PIXEL_BSHIFT ) |( green<<PICO_SCANVIDEO_PIXEL_GSHIFT ) |( red<<PICO_SCANVIDEO_PIXEL_RSHIFT ) );
+    // uint32_t red = (color & 0xE00000) >> 21;
+    // uint32_t green = (color & 0xE000) >> 13;
+    // uint32_t blue = (color & 0xC0) >> 6;
+    //return (uint16_t)( ( blue<<PICO_SCANVIDEO_PIXEL_BSHIFT ) |( green<<PICO_SCANVIDEO_PIXEL_GSHIFT ) |( red<<PICO_SCANVIDEO_PIXEL_RSHIFT ) );
+    
+    // I did the MSB-->LSB backwards on the PCB
+    uint8_t red = (color >> 16) & 0xE0;
+    uint8_t green = (color >> 8) & 0xE0;
+    uint8_t blue = color & 0xC0;
+    return rgb888_to_rgb332_alt(red, green, blue);
+}
+
+static uint16_t rgb888_to_rgb332_alt(uint8_t r, uint8_t g, uint8_t b)
+{
+  // I did the MSB-->LSB backwards on the PCB
+
+  r = reverse(r);
+  g = reverse(g);
+  b = reverse(b);
+  uint32_t red = (uint32_t)r;
+  uint32_t green = (uint32_t)g;
+  uint32_t blue = (uint32_t)b;
+
+  return (uint16_t)( ( blue<<PICO_SCANVIDEO_PIXEL_BSHIFT ) |( green<<PICO_SCANVIDEO_PIXEL_GSHIFT ) |( red<<PICO_SCANVIDEO_PIXEL_RSHIFT ) );
 }
 
 static void blink(uint8_t count, uint16_t millis_on, uint16_t millis_off)
