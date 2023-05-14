@@ -2,6 +2,10 @@
 // PICO-LCD
 // 2023.05.07
 
+// Note about scanvideo:
+// When scaling, there is a bug in scanvideo.c that prevents line zero from repeating
+// see my fix --> https://github.com/joeostrander/pico-extras/commit/3ed9467f0203acd9bedfdbb08bed8f31b61b320c
+
 #include <stdio.h>
 #include <stdlib.h>
 #include "time.h"
@@ -21,6 +25,8 @@
 #define ONBOARD_LED_PIN             25
 #define BACKLIGHT_PWM_PIN           12
 #define BACKLIGHT_PWM_MAX           0xFFFF
+
+// #define PCB_V1  // MSB-->LSB bits reversed
 
 const scanvideo_timing_t vga_timing_480x272 =
 {
@@ -132,8 +138,8 @@ static uint16_t rgb888_to_rgb332(uint32_t color);
 static uint16_t rgb888_to_rgb332_alt(uint8_t r, uint8_t g, uint8_t b);
 static void blink(uint8_t count, uint16_t millis_on, uint16_t millis_off);
 static void set_backlight_level(int backlight_level);
-int32_t single_solid_line(uint32_t *buf, size_t buf_length, uint16_t color);
-uint8_t reverse(uint8_t b);
+static uint8_t reverse(uint8_t b);
+static int32_t single_solid_line(uint32_t *buf, size_t buf_length, uint16_t color);
 
 int main(void) 
 {
@@ -160,7 +166,7 @@ int main(void)
     }
 }
 
-int32_t single_solid_line(uint32_t *buf, size_t buf_length, uint16_t color)
+static int32_t single_solid_line(uint32_t *buf, size_t buf_length, uint16_t color)
 {
     uint16_t *p16 = (uint16_t *) buf;
 
@@ -355,14 +361,6 @@ int32_t single_scanline(uint32_t *buf, size_t buf_length, int line_index)
 
 }
 
-uint8_t reverse(uint8_t b) 
-{
-   b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
-   b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
-   b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
-   return b;
-}
-
 static void core1_func(void) 
 {
     
@@ -402,30 +400,35 @@ static void initialize_gpio(void)
 
 static uint16_t rgb888_to_rgb332(uint32_t color)
 {
-    // uint32_t red = (color & 0xE00000) >> 21;
-    // uint32_t green = (color & 0xE000) >> 13;
-    // uint32_t blue = (color & 0xC0) >> 6;
-    //return (uint16_t)( ( blue<<PICO_SCANVIDEO_PIXEL_BSHIFT ) |( green<<PICO_SCANVIDEO_PIXEL_GSHIFT ) |( red<<PICO_SCANVIDEO_PIXEL_RSHIFT ) );
-    
-    // I did the MSB-->LSB backwards on the PCB
     uint8_t red = (color >> 16) & 0xE0;
     uint8_t green = (color >> 8) & 0xE0;
     uint8_t blue = color & 0xC0;
     return rgb888_to_rgb332_alt(red, green, blue);
 }
 
+#ifdef PCB_V1
 static uint16_t rgb888_to_rgb332_alt(uint8_t r, uint8_t g, uint8_t b)
 {
-  // I did the MSB-->LSB backwards on the PCB
-
   r = reverse(r);
   g = reverse(g);
   b = reverse(b);
-  uint32_t red = (uint32_t)r;
-  uint32_t green = (uint32_t)g;
-  uint32_t blue = (uint32_t)b;
+  return (uint16_t)((r<<5) | (g<<2) | b);
+}
+#else
+static uint16_t rgb888_to_rgb332_alt(uint8_t r, uint8_t g, uint8_t b)
+{
+  return (uint16_t)(r | (g>>3) | (b>>6));
+}
+#endif  
 
-  return (uint16_t)( ( blue<<PICO_SCANVIDEO_PIXEL_BSHIFT ) |( green<<PICO_SCANVIDEO_PIXEL_GSHIFT ) |( red<<PICO_SCANVIDEO_PIXEL_RSHIFT ) );
+
+
+static uint8_t reverse(uint8_t b) 
+{
+   b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+   b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+   b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+   return b;
 }
 
 static void blink(uint8_t count, uint16_t millis_on, uint16_t millis_off)
